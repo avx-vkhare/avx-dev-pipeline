@@ -6,6 +6,8 @@ Then open http://127.0.0.1:7860
 """
 
 import queue
+import random
+import string
 import threading
 import anyio
 print("[ui] importing gradio...", flush=True)
@@ -33,10 +35,12 @@ def emit_fn(msg: str):
         return
     # Stage headers
     for keyword, stage in [
-        ("PLANNER",     "plan"),
-        ("CODER",       "code"),
-        ("TEST WRITER", "test"),
-        ("REVIEWER",    "review"),
+        ("PLANNER",             "plan"),
+        ("CODER",               "code"),
+        ("TEST WRITER",         "test"),
+        ("REVIEWER",            "review"),
+        ("PR CREATOR",          "pr"),
+        ("PR COMMENTS HANDLER", "pr_comments"),
     ]:
         if keyword in s and "=" * 10 in s:
             output_q.put(("stage", stage))
@@ -63,9 +67,10 @@ def run_pipeline_in_thread(ctx: ProjectContext):
 # ---------------------------------------------------------------------------
 # Progress bar HTML
 # ---------------------------------------------------------------------------
-STAGE_ORDER  = ["plan", "code", "test", "review", "done"]
+STAGE_ORDER  = ["plan", "code", "test", "review", "pr", "pr_comments", "done"]
 STAGE_LABELS = {"plan": "📋 Plan", "code": "💻 Code", "test": "🧪 Tests",
-                "review": "🔍 Review", "done": "✅ Done"}
+                "review": "🔍 Review", "pr": "🚀 PR", "pr_comments": "💬 Comments",
+                "done": "✅ Done"}
 
 def progress_html(active: str, spinning: bool) -> str:
     parts = []
@@ -98,48 +103,25 @@ def progress_html(active: str, spinning: bool) -> str:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-DEFAULT_TESTS = "\n".join([
-    "bazel test //go/aviatrix.com/conduit/v2/gateway-conduit:gateway-conduit_test",
-    "bazel test //go/aviatrix.com/launcher/launchertest:launchertest_etcd_test",
-    "bazel test //go/aviatrix.com/launcher/gateway_launcher:gateway_launcher_test",
-    "bazel test //go/aviatrix.com/conduit/v2/controller-conduit:controller-conduit_test",
-])
-DEFAULT_LINT = "\n".join(["make lint-standard", "make lint-avx", "make lint-strict"])
+REPO_PATH = "/home/vkhare/cloudn"
+LANGUAGE  = "Go and Python"
+def _random_suffix(n=8) -> str:
+    return "".join(random.choices(string.ascii_lowercase, k=n))
 
-with gr.Blocks(title="Dev Pipeline") as demo:
-    gr.Markdown("# Dev Pipeline")
+
+with gr.Blocks(title="BhramASTRA") as demo:
+    gr.Markdown("# BhramASTRA")
     progress_bar = gr.HTML(value=progress_html("plan", False))
 
     # ---- Config form -------------------------------------------------------
     with gr.Accordion("⚙️  Task Configuration", open=True) as config_panel:
         with gr.Row():
             fi_ticket = gr.Textbox(label="Jira Ticket ID", placeholder="AVX-73843", scale=1)
-            fi_branch = gr.Textbox(label="Branch Name",    placeholder="AVX-73843-my-fix", scale=1)
-            fi_lang   = gr.Dropdown(
-                label="Language",
-                choices=["Go", "Python", "Go and Python"],
-                value="Go", scale=1,
-            )
         fi_task = gr.Textbox(
             label="Task Description",
             placeholder="Plain English description of what needs to be done",
             lines=2,
         )
-        fi_repo = gr.Textbox(
-            label="Repo Path",
-            value="/home/vkhare/cloudn",
-        )
-        with gr.Row():
-            fi_tests = gr.Textbox(
-                label="Test Commands (one per line)",
-                value=DEFAULT_TESTS,
-                lines=4, scale=2,
-            )
-            fi_lint = gr.Textbox(
-                label="Lint Commands (one per line)",
-                value=DEFAULT_LINT,
-                lines=4, scale=1,
-            )
 
     # ---- Main area: action log + chat side by side -------------------------
     with gr.Row():
@@ -165,19 +147,22 @@ with gr.Blocks(title="Dev Pipeline") as demo:
     action_log = gr.State("")
 
     # ---- Handlers ----------------------------------------------------------
-    def start_pipeline(ticket, branch, lang, task, repo, tests_raw, lint_raw):
+    def start_pipeline(ticket, task):
         global pipeline_thread, output_q, input_q
 
         # Validate required fields
-        if not ticket.strip() or not task.strip() or not branch.strip():
+        if not ticket.strip() or not task.strip():
             return (
                 gr.update(),                              # chatbot
                 gr.update(), gr.update(), gr.update(),   # waiting, cur_stage, action_log
                 gr.update(interactive=True),              # start_btn stays enabled
-                gr.update(value="⚠ Fill in Jira Ticket, Branch, and Task first."),  # status
+                gr.update(value="⚠ Fill in Jira Ticket and Task first."),  # status
                 gr.update(),                              # progress_bar
                 gr.update(),                              # action_bar
             )
+
+        # Auto-generate branch name
+        branch = f"{ticket.strip()}-{_random_suffix()}"
 
         # Clear stale queues
         while not output_q.empty(): output_q.get_nowait()
@@ -187,18 +172,18 @@ with gr.Blocks(title="Dev Pipeline") as demo:
 
         from pathlib import Path
         guidelines = ""
-        claude_md = Path(repo) / "CLAUDE.md"
+        claude_md = Path(REPO_PATH) / "CLAUDE.md"
         if claude_md.exists():
             guidelines = claude_md.read_text()
 
         ctx = ProjectContext(
-            repo_path=repo.strip(),
-            language=lang,
+            repo_path=REPO_PATH,
+            language=LANGUAGE,
             jira_ticket=ticket.strip(),
             task_description=task.strip(),
-            branch_name=branch.strip(),
-            test_commands=[l.strip() for l in tests_raw.splitlines() if l.strip()],
-            lint_commands=[l.strip() for l in lint_raw.splitlines() if l.strip()],
+            branch_name=branch,
+            test_commands=[],
+            lint_commands=[],
             coding_guidelines=guidelines,
         )
         pipeline_thread = threading.Thread(
@@ -206,15 +191,16 @@ with gr.Blocks(title="Dev Pipeline") as demo:
         )
         pipeline_thread.start()
 
+        initial_log = f"Branch: {branch}\n"
         return (
-            [],                              # clear chatbot
-            False,                           # reset waiting
-            "plan",                          # reset stage
-            "",                              # clear action_log state
-            gr.update(interactive=False),    # disable start_btn
+            [],                                    # clear chatbot
+            False,                                 # reset waiting
+            "plan",                                # reset stage
+            initial_log,                           # seed action_log with branch name
+            gr.update(interactive=False),          # disable start_btn
             gr.update(value="Running..."),
             progress_html("plan", True),
-            gr.update(value="Starting..."),  # action_bar
+            gr.update(value=initial_log),          # action_bar shows branch immediately
         )
 
     def poll(history, is_waiting, stage, action_log):
@@ -272,7 +258,7 @@ with gr.Blocks(title="Dev Pipeline") as demo:
     # ---- Wire events -------------------------------------------------------
     start_btn.click(
         start_pipeline,
-        inputs=[fi_ticket, fi_branch, fi_lang, fi_task, fi_repo, fi_tests, fi_lint],
+        inputs=[fi_ticket, fi_task],
         outputs=[chatbot, waiting, cur_stage, action_log, start_btn, status, progress_bar, action_bar],
     )
 

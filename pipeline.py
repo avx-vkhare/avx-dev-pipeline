@@ -1,5 +1,5 @@
 """
-Dev pipeline: Plan → Code → [Test Writer ‖ Reviewer] → (fix loop if FAIL) → done
+BhramASTRA: Plan → Code → [Test Writer ‖ Reviewer] → (fix loop if FAIL) → PR → PR Comments → done
 
 State is saved to .pipeline_state.json after every stage so you can resume
 at any point by re-running run.py.
@@ -19,7 +19,7 @@ from claude_agent_sdk import (
 )
 
 from context import ProjectContext
-from agents.prompts import planner_prompt, coder_prompt, test_writer_prompt, reviewer_prompt
+from agents.prompts import planner_prompt, coder_prompt, test_writer_prompt, reviewer_prompt, pr_creator_prompt, pr_comments_prompt
 
 STATE_FILE = ".pipeline_state.json"
 MAX_ITERATIONS = 3
@@ -44,6 +44,23 @@ def load_state(ctx: ProjectContext) -> dict | None:
 def clear_state(ctx: ProjectContext):
     path = Path(ctx.repo_path) / STATE_FILE
     path.unlink(missing_ok=True)
+
+
+def _extract_test_commands(text: str) -> list[str]:
+    """Parse TEST_COMMANDS: section from test writer output."""
+    cmds = []
+    in_section = False
+    for line in text.splitlines():
+        if line.strip() == "TEST_COMMANDS:":
+            in_section = True
+            continue
+        if in_section:
+            stripped = line.strip()
+            if stripped.startswith("bazel "):
+                cmds.append(stripped)
+            elif stripped and not stripped.startswith("#"):
+                break  # end of section
+    return cmds
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +132,9 @@ def _tool_status(tool_name: str, tool_input: dict) -> str:
     if name == "grep":
         return f"🔍 Searching code: {tool_input.get('pattern', '')}"
     if name == "bash":
-        cmd = tool_input.get("command", "")[:80]
+        cmd = tool_input.get("command", "")
+        if not cmd.startswith("bazel test"):
+            cmd = cmd[:80]
         return f"⚙️  Running: {cmd}"
     # Jira MCP tools
     if "jira" in name or "issue" in name:
@@ -291,7 +310,7 @@ async def run_pipeline(
     # -----------------------------------------------------------------------
     # STAGE: CODE → REVIEW loop
     # -----------------------------------------------------------------------
-    while True:
+    while state["stage"] in ("code", "review"):
         if state["stage"] == "code":
             iteration = state["iteration"]
             feedback = state.get("review_feedback")
@@ -331,6 +350,11 @@ async def run_pipeline(
                     ctx=ctx,
                     emit_fn=emit_fn,
                 )
+                # Extract TEST_COMMANDS section and store in state
+                test_cmds = _extract_test_commands(results["tests"])
+                if test_cmds:
+                    state["test_commands"] = test_cmds
+                    emit_fn(f"\n📋 Test commands:\n" + "\n".join(test_cmds))
 
             async def do_review():
                 results["review"] = await run_agent(
@@ -351,9 +375,10 @@ async def run_pipeline(
             review_result = checkpoint_review(review_result, state["iteration"], ask_fn, emit_fn)
 
             if "PASS" in review_result:
-                emit_fn("\n✓ Review PASSED. Pipeline complete.")
-                clear_state(ctx)
-                return
+                emit_fn("\n✓ Review PASSED. Moving to PR creation.")
+                state.update({"stage": "pr"})
+                save_state(state, ctx)
+                break
 
             if state["iteration"] >= MAX_ITERATIONS:
                 emit_fn(f"\n✗ Review failed after {MAX_ITERATIONS} iterations. Manual intervention needed.")
@@ -362,3 +387,68 @@ async def run_pipeline(
 
             state.update({"stage": "code", "review_feedback": review_result})
             save_state(state, ctx)
+
+    # -----------------------------------------------------------------------
+    # STAGE: PR CREATION
+    # -----------------------------------------------------------------------
+    if state["stage"] == "pr":
+        pr_result = await run_agent(
+            label="PR CREATOR",
+            prompt=(
+                f"Jira ticket: {ctx.jira_ticket}\n"
+                f"Task: {ctx.task_description}\n"
+                f"Branch: {ctx.branch_name}\n\n"
+                f"Commit all implementation changes, push to remote, and open a GitHub PR. "
+                f"Print the PR URL as the very last line of your output."
+            ),
+            system_prompt=pr_creator_prompt(ctx),
+            tools=["Bash", "Read", "Glob"],
+            ctx=ctx,
+            emit_fn=emit_fn,
+            bypass_permissions=True,
+        )
+        # Extract PR URL — last non-empty line of the result
+        pr_url = next(
+            (line.strip() for line in reversed(pr_result.splitlines()) if line.strip()),
+            "",
+        )
+        emit_fn(f"\n✓ PR created: {pr_url}")
+        state.update({"stage": "pr_comments", "pr_url": pr_url})
+        save_state(state, ctx)
+
+    # -----------------------------------------------------------------------
+    # STAGE: PR COMMENTS  (interactive loop)
+    # -----------------------------------------------------------------------
+    if state["stage"] == "pr_comments":
+        pr_url = state.get("pr_url", "")
+        emit_fn(f"\nPR is open: {pr_url}")
+
+        while True:
+            action = ask_fn(
+                "PR is open.\n  c = fetch & handle new review comments\n  d = done (PR merged)\n  a = abort"
+            ).strip().lower()
+
+            if action == "d":
+                emit_fn("Pipeline complete. PR merged.")
+                clear_state(ctx)
+                return
+            if action == "a":
+                raise SystemExit("Aborted by user.")
+            if action != "c":
+                continue
+
+            summary = await run_agent(
+                label="PR COMMENTS HANDLER",
+                prompt=(
+                    f"PR URL: {pr_url}\n"
+                    f"Jira: {ctx.jira_ticket}\n\n"
+                    f"Fetch all unresolved review comments on this PR, make the requested "
+                    f"code changes, reply to each comment, then commit and push."
+                ),
+                system_prompt=pr_comments_prompt(ctx, state["plan"], pr_url),
+                tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
+                ctx=ctx,
+                emit_fn=emit_fn,
+                bypass_permissions=True,
+            )
+            emit_fn(f"\n--- Comments handled ---\n{summary}")
