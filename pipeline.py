@@ -1,5 +1,5 @@
 """
-BhramASTRA: Plan → Code → [Test Writer ‖ Reviewer] → (fix loop if FAIL) → PR → PR Comments → done
+BhramASTRA: [RCA] → Plan → Code → [Test Writer ‖ Reviewer] → (fix loop if FAIL) → PR → PR Comments → done
 
 State is saved to .pipeline_state.json after every stage so you can resume
 at any point by re-running run.py.
@@ -9,7 +9,9 @@ emit_fn : callable(msg: str)             — defaults to print()
 """
 
 import json
+import shutil
 import subprocess
+import tarfile
 import anyio
 from pathlib import Path
 
@@ -19,7 +21,7 @@ from claude_agent_sdk import (
 )
 
 from context import ProjectContext
-from agents.prompts import planner_prompt, coder_prompt, test_writer_prompt, reviewer_prompt, pr_creator_prompt, pr_comments_prompt
+from agents.prompts import planner_prompt, coder_prompt, test_writer_prompt, reviewer_prompt, pr_creator_prompt, pr_comments_prompt, rca_prompt, failure_rca_prompt
 
 STATE_FILE = ".pipeline_state.json"
 MAX_ITERATIONS = 3
@@ -61,6 +63,17 @@ def _extract_test_commands(text: str) -> list[str]:
             elif stripped and not stripped.startswith("#"):
                 break  # end of section
     return cmds
+
+
+def _tests_passed(text: str) -> bool:
+    """Heuristic: did the test writer's run succeed?"""
+    lower = text.lower()
+    fail_signals = ["fail", "error:", "panic:", "build failed", "test failed", "bazel: error", "compilation failed"]
+    for sig in fail_signals:
+        if sig in lower:
+            return False
+    return True
+
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +231,7 @@ async def refine_plan(plan: str, ctx, ask_fn, emit_fn) -> str:
                 f"The user says: {user_input}\n\n"
                 f"If this is a question, answer it clearly. "
                 f"If this is a change request, update the plan accordingly. "
-                f"Always output the complete final plan as JSON at the end."
+                f"Always output the complete final plan in the required markdown format."
             ),
             system_prompt=planner_prompt(ctx),
             tools=["Read", "Glob", "Grep"],
@@ -230,19 +243,116 @@ async def refine_plan(plan: str, ctx, ask_fn, emit_fn) -> str:
         emit_fn(f"\n--- UPDATED PLAN ---\n{current_plan}\n{'-'*40}")
 
 
-def checkpoint_review(review: str, iteration: int, ask_fn, emit_fn) -> str:
+def _pre_extract_logs(log_files: list[str], extract_dir: str, emit_fn) -> None:
+    """Extract only var/log/* from each bundle into its own subdir before the agent starts."""
+    for log_file in log_files:
+        name = Path(log_file).name
+        # strip extensions: .tgz or .tar.gz
+        subdir_name = name.removesuffix(".tgz").removesuffix(".tar.gz").removesuffix(".tar")
+        subdir = Path(extract_dir) / subdir_name
+        subdir.mkdir(parents=True, exist_ok=True)
+        emit_fn(f"[rca] Extracting var/log from {name}...")
+        try:
+            with tarfile.open(log_file, "r:gz") as tar:
+                members = [m for m in tar.getmembers() if "var/log" in m.name]
+                tar.extractall(path=subdir, members=members, filter="data")
+            emit_fn(f"[rca] Extracted {len(members)} files → {subdir}")
+        except Exception as e:
+            emit_fn(f"[rca] Warning: could not extract {name}: {e}")
+
+
+async def run_rca(ctx, emit_fn) -> str:
+    """Pre-plan RCA: always runs. Uses log bundles if provided, otherwise reasons from Jira + codebase."""
+    import time
+    extract_dir = f"/tmp/rca_{ctx.jira_ticket}_{int(time.time())}"
+
+    if ctx.log_files:
+        _pre_extract_logs(ctx.log_files, extract_dir, emit_fn)
+
+    prompt = (
+        f"Jira ticket: {ctx.jira_ticket}\n"
+        f"Task: {ctx.task_description}\n\n"
+        + (
+            f"Logs already extracted to: {extract_dir}\n"
+            + "\n".join(f"  - {Path(extract_dir) / Path(f).name.removesuffix('.tgz').removesuffix('.tar.gz')}" for f in ctx.log_files)
+            + "\n\n"
+            if ctx.log_files else
+            "No log files provided — reason from the Jira ticket and codebase.\n\n"
+        )
+        + "Produce a ROOT_CAUSE_ANALYSIS."
+    )
+    try:
+        return await run_agent(
+            label="RCA",
+            prompt=prompt,
+            system_prompt=rca_prompt(ctx, ctx.log_files, extract_dir),
+            tools=["Bash", "Read", "Grep", "Glob"],
+            ctx=ctx,
+            emit_fn=emit_fn,
+            extra_mcp=_jira_mcp_server(),
+            bypass_permissions=True,
+        )
+    finally:
+        if Path(extract_dir).exists():
+            shutil.rmtree(extract_dir)
+            emit_fn(f"[rca] Cleaned up {extract_dir}")
+
+
+async def run_failure_rca(failure_context: str, ctx, emit_fn) -> str:
+    """Checkpoint RCA: analyze a test/review failure using local code context."""
+    return await run_agent(
+        label="RCA",
+        prompt=(
+            f"Failure context:\n{failure_context}\n\n"
+            f"Analyze the git diff and failing code to produce a ROOT_CAUSE_ANALYSIS."
+        ),
+        system_prompt=failure_rca_prompt(ctx, failure_context),
+        tools=["Bash", "Read", "Grep", "Glob"],
+        ctx=ctx,
+        emit_fn=emit_fn,
+        bypass_permissions=True,
+    )
+
+
+async def checkpoint_review(review: str, iteration: int, ask_fn, emit_fn, ctx=None) -> str:
     emit_fn(f"\n--- REVIEW (iteration {iteration}) ---\n{review}\n{'-'*40}")
     if "PASS" in review:
         return review
+    emit_fn("\n🔍 Running RCA...")
+    rca = await run_failure_rca(review, ctx, emit_fn)
+    emit_fn(f"\n--- ROOT CAUSE ANALYSIS ---\n{rca}\n{'-'*40}")
     while True:
         action = ask_fn("Review FAILED.  c=send to coder  e=edit feedback  a=abort").strip().lower()
         if action == "a":
             raise SystemExit("Aborted by user.")
         elif action == "c":
-            return review
+            return f"{review}\n\nRCA:\n{rca}"
         elif action == "e":
             edited = ask_fn("Paste your edited feedback and send:").strip()
-            return edited if edited else review
+            return edited if edited else f"{review}\n\nRCA:\n{rca}"
+
+
+async def checkpoint_blocked(label: str, details: str, ask_fn, emit_fn, ctx=None) -> str:
+    """Run failure RCA then ask user what to do when blocked (e.g. tests failing).
+
+    Returns: 'proceed' | 'retry'  — raises SystemExit on abort.
+    """
+    emit_fn(f"\n⚠️  BLOCKED: {label}\n\n🔍 Running RCA...")
+    rca = await run_failure_rca(details, ctx, emit_fn)
+    emit_fn(f"\n--- ROOT CAUSE ANALYSIS ---\n{rca}\n{'-'*40}")
+    while True:
+        action = ask_fn(
+            "  p = proceed anyway (skip this failure)\n"
+            "  r = retry (send back to coder with RCA as feedback)\n"
+            "  a = abort"
+        ).strip().lower()
+        if action == "a":
+            raise SystemExit("Aborted by user.")
+        elif action == "p":
+            emit_fn(f"Proceeding past blocked state: {label}")
+            return "proceed"
+        elif action in ("r", "retry"):
+            return "retry"
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +380,18 @@ async def run_pipeline(
 
     if not state:
         state = {
-            "stage": "plan",
+            "stage": "rca",
+            "rca": None,
             "plan": None,
             "review_feedback": None,
             "iteration": 0,
+            "branch_name": ctx.branch_name,
         }
+    else:
+        # Restore the branch from saved state so resume goes back to the right branch
+        if "branch_name" in state:
+            ctx.branch_name = state["branch_name"]
+            emit_fn(f"[resume] Restored branch: {ctx.branch_name}")
 
     # --- Branch setup ---
     try:
@@ -284,15 +401,31 @@ async def run_pipeline(
         return
 
     # -----------------------------------------------------------------------
+    # STAGE: RCA  (only when log files are provided)
+    # -----------------------------------------------------------------------
+    if state["stage"] == "rca":
+        if ctx.log_files:
+            emit_fn(f"\n📂 Log files: {', '.join(Path(f).name for f in ctx.log_files)}")
+            emit_fn("⏳ Extracting logs and starting RCA — this may take a minute...")
+        else:
+            emit_fn("⏳ Starting RCA — fetching Jira ticket and exploring codebase...")
+        rca = await run_rca(ctx, emit_fn)
+        emit_fn(f"\n--- ROOT CAUSE ANALYSIS ---\n{rca}\n{'-'*40}")
+        state.update({"stage": "plan", "rca": rca})
+        save_state(state, ctx)
+
+    # -----------------------------------------------------------------------
     # STAGE: PLAN
     # -----------------------------------------------------------------------
     if state["stage"] == "plan":
+        rca = state.get("rca") or ""
         plan_raw = await run_agent(
             label="PLANNER",
             prompt=(
                 f"Jira ticket: {ctx.jira_ticket}\n"
-                f"Task: {ctx.task_description}\n\n"
-                f"First fetch the Jira ticket using the jira MCP tools to get the full "
+                f"Task: {ctx.task_description}\n"
+                + (f"RCA: {rca}\n" if rca else "")
+                + f"\nFirst fetch the Jira ticket using the jira MCP tools to get the full "
                 f"description, acceptance criteria, and any linked issues. "
                 f"Then explore the codebase and produce the plan."
             ),
@@ -342,37 +475,58 @@ async def run_pipeline(
             results = {}
 
             async def do_tests():
-                results["tests"] = await run_agent(
-                    label="TEST WRITER",
-                    prompt="Write tests covering all acceptance criteria in the plan.",
-                    system_prompt=test_writer_prompt(ctx, state["plan"]),
-                    tools=["Read", "Write", "Glob", "Grep", "Bash"],
-                    ctx=ctx,
-                    emit_fn=emit_fn,
-                )
-                # Extract TEST_COMMANDS section and store in state
-                test_cmds = _extract_test_commands(results["tests"])
-                if test_cmds:
-                    state["test_commands"] = test_cmds
-                    emit_fn(f"\n📋 Test commands:\n" + "\n".join(test_cmds))
+                try:
+                    results["tests"] = await run_agent(
+                        label="TEST WRITER",
+                        prompt="Write tests covering all acceptance criteria in the plan.",
+                        system_prompt=test_writer_prompt(ctx, state["plan"]),
+                        tools=["Read", "Write", "Glob", "Grep", "Bash"],
+                        ctx=ctx,
+                        emit_fn=emit_fn,
+                    )
+                    test_cmds = _extract_test_commands(results["tests"])
+                    if test_cmds:
+                        state["test_commands"] = test_cmds
+                        emit_fn(f"\n📋 Test commands:\n" + "\n".join(test_cmds))
+                except Exception as e:
+                    emit_fn(f"\n⚠️  TEST WRITER error: {e}")
+                    results["tests"] = f"TEST WRITER failed: {e}"
 
             async def do_review():
-                results["review"] = await run_agent(
-                    label="REVIEWER",
-                    prompt="Review the implementation against the plan.",
-                    system_prompt=reviewer_prompt(ctx, state["plan"]),
-                    tools=["Read", "Glob", "Grep", "Bash"],
-                    ctx=ctx,
-                    emit_fn=emit_fn,
-                    bypass_permissions=True,   # read-only, safe to bypass
-                )
+                try:
+                    results["review"] = await run_agent(
+                        label="REVIEWER",
+                        prompt="Review the implementation against the plan.",
+                        system_prompt=reviewer_prompt(ctx, state["plan"]),
+                        tools=["Read", "Glob", "Grep", "Bash"],
+                        ctx=ctx,
+                        emit_fn=emit_fn,
+                        bypass_permissions=True,
+                    )
+                except Exception as e:
+                    emit_fn(f"\n⚠️  REVIEWER error: {e}")
+                    results["review"] = f"VERDICT: FAIL\nISSUES:\n- REVIEWER agent failed: {e}\nREQUIRED_FIXES:\n- Retry the review."
 
             async with anyio.create_task_group() as tg:
                 tg.start_soon(do_tests)
                 tg.start_soon(do_review)
 
+            # Check for test failures before proceeding to review gate
+            test_output = results.get("tests", "")
+            if test_output and not _tests_passed(test_output):
+                blocked_action = await checkpoint_blocked("Tests are failing", test_output, ask_fn, emit_fn, ctx)
+                if blocked_action == "retry":
+                    # RCA output is already in the checkpoint; pass full test output as feedback
+                    state.update({
+                        "stage": "code",
+                        "review_feedback": f"Tests are failing:\n\n{test_output}",
+                    })
+                    save_state(state, ctx)
+                    continue
+                # "proceed" — fall through to review gate
+
             review_result = results["review"]
-            review_result = checkpoint_review(review_result, state["iteration"], ask_fn, emit_fn)
+            review_result = await checkpoint_review(review_result, state["iteration"], ask_fn, emit_fn, ctx)
 
             if "PASS" in review_result:
                 emit_fn("\n✓ Review PASSED. Moving to PR creation.")

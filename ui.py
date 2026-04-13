@@ -35,6 +35,7 @@ def emit_fn(msg: str):
         return
     # Stage headers
     for keyword, stage in [
+        ("RCA",                 "rca"),
         ("PLANNER",             "plan"),
         ("CODER",               "code"),
         ("TEST WRITER",         "test"),
@@ -59,7 +60,8 @@ def run_pipeline_in_thread(ctx: ProjectContext):
     except SystemExit as e:
         output_q.put(("msg", f"Pipeline stopped: {e}"))
     except Exception as e:
-        output_q.put(("msg", f"Pipeline error: {e}"))
+        import traceback
+        output_q.put(("msg", f"Pipeline error: {e}\n{traceback.format_exc()}"))
     finally:
         output_q.put(("done", ""))
 
@@ -67,8 +69,8 @@ def run_pipeline_in_thread(ctx: ProjectContext):
 # ---------------------------------------------------------------------------
 # Progress bar HTML
 # ---------------------------------------------------------------------------
-STAGE_ORDER  = ["plan", "code", "test", "review", "pr", "pr_comments", "done"]
-STAGE_LABELS = {"plan": "📋 Plan", "code": "💻 Code", "test": "🧪 Tests",
+STAGE_ORDER  = ["rca", "plan", "code", "test", "review", "pr", "pr_comments", "done"]
+STAGE_LABELS = {"rca": "🔎 RCA", "plan": "📋 Plan", "code": "💻 Code", "test": "🧪 Tests",
                 "review": "🔍 Review", "pr": "🚀 PR", "pr_comments": "💬 Comments",
                 "done": "✅ Done"}
 
@@ -123,6 +125,13 @@ with gr.Blocks(title="BhramASTRA") as demo:
             lines=2,
         )
 
+    with gr.Accordion("📂  Customer Log Bundles (optional — for RCA before planning)", open=False):
+        fi_log_upload = gr.File(
+            label="Upload log bundles (.tgz)",
+            file_types=[".tgz", ".tar.gz", ".gz", ".zip", ".log"],
+            file_count="multiple",
+        )
+
     # ---- Main area: action log + chat side by side -------------------------
     with gr.Row():
         action_bar = gr.Textbox(
@@ -147,7 +156,7 @@ with gr.Blocks(title="BhramASTRA") as demo:
     action_log = gr.State("")
 
     # ---- Handlers ----------------------------------------------------------
-    def start_pipeline(ticket, task):
+    def start_pipeline(ticket, task, uploaded_files):
         global pipeline_thread, output_q, input_q
 
         # Validate required fields
@@ -170,21 +179,19 @@ with gr.Blocks(title="BhramASTRA") as demo:
         if pipeline_thread and pipeline_thread.is_alive():
             input_q.put("__stop__")
 
-        from pathlib import Path
-        guidelines = ""
-        claude_md = Path(REPO_PATH) / "CLAUDE.md"
-        if claude_md.exists():
-            guidelines = claude_md.read_text()
-
-        ctx = ProjectContext(
+        # gr.File returns a list of NamedString / tempfile objects; extract the path
+        log_files = []
+        for f in (uploaded_files or []):
+            path = f.name if hasattr(f, "name") else str(f)
+            if path:
+                log_files.append(path)
+        ctx = ProjectContext.from_repo(
             repo_path=REPO_PATH,
-            language=LANGUAGE,
             jira_ticket=ticket.strip(),
-            task_description=task.strip(),
-            branch_name=branch,
-            test_commands=[],
-            lint_commands=[],
-            coding_guidelines=guidelines,
+            task=task.strip(),
+            branch=branch,
+            language=LANGUAGE,
+            log_files=log_files,
         )
         pipeline_thread = threading.Thread(
             target=run_pipeline_in_thread, args=(ctx,), daemon=True
@@ -258,7 +265,7 @@ with gr.Blocks(title="BhramASTRA") as demo:
     # ---- Wire events -------------------------------------------------------
     start_btn.click(
         start_pipeline,
-        inputs=[fi_ticket, fi_task],
+        inputs=[fi_ticket, fi_task, fi_log_upload],
         outputs=[chatbot, waiting, cur_stage, action_log, start_btn, status, progress_bar, action_bar],
     )
 

@@ -5,19 +5,35 @@ from __future__ import annotations
 def planner_prompt(ctx) -> str:
     return f"""You are a software architect for a {ctx.language} codebase.
 
-Given a task, produce a structured JSON plan with these exact keys:
-{{
-  "files_to_change": ["path/to/file.go"],
-  "approach": "step-by-step description",
-  "risks": ["potential issue 1"],
-  "acceptance_criteria": ["verifiable criterion 1"]
-}}
+Given a task, produce a plan using EXACTLY this markdown format — no deviations:
 
-Coding guidelines:
-{ctx.coding_guidelines}
+## Summary
+<2-3 sentences describing what this change does and why>
+
+## Files to Change
+- `path/to/file.go` — <one-line reason>
+
+## Approach
+1. <Step one — specific and actionable>
+2. <Step two>
+3. <Step three>
+(as many steps as needed)
+
+## Risks
+- <Risk 1>
+- <Risk 2 — or "None" if no risks>
+
+## Acceptance Criteria
+- [ ] <Verifiable criterion 1>
+- [ ] <Verifiable criterion 2>
+
+If an RCA is provided in the task, use it to directly inform the approach and acceptance criteria.
+
+Architecture and coding guidelines:
+{ctx.planner_guidelines}
 
 Repo: {ctx.repo_path}
-Output ONLY valid JSON. No markdown fences."""
+Output ONLY the markdown plan. No extra commentary outside the sections."""
 
 
 def coder_prompt(ctx, plan: str) -> str:
@@ -121,7 +137,7 @@ Your job:
 3. Commit with message format: "{ctx.jira_ticket}: <short description>"
    - The description should be a concise summary of the change (max 72 chars total).
 4. Push to remote: `git push -u origin {ctx.branch_name}`
-5. Create a PR with `gh pr create`. Use a HEREDOC for the body.
+5. Create a PR with `gh pr create --draft`. Use a HEREDOC for the body.
    - Title: "{ctx.jira_ticket}: <same short description as commit>"
    - Body sections: ## Summary, ## Test plan, ## Jira
    - Jira link: https://aviatrix.atlassian.net/browse/{ctx.jira_ticket}
@@ -136,6 +152,80 @@ Rules:
 
 Repo: {ctx.repo_path}
 Branch: {ctx.branch_name}
+Jira: {ctx.jira_ticket}"""
+
+
+def rca_prompt(ctx, log_files: list[str], extract_dir: str = "/tmp/rca_logs") -> str:
+    if log_files:
+        files_list = "\n".join(f"  - {f}" for f in log_files)
+        evidence_steps = f"""
+Step 2 — Analyze customer log bundles:
+  Log files:
+{files_list}
+
+  Logs are already extracted (var/log only) into per-bundle subdirs under {extract_dir}/:
+  a. find {extract_dir} -type f | sort   # see what is available
+  b. grep -r -i "error\|panic\|fatal\|exception\|traceback\|failed" {extract_dir}/ | head -200
+  c. Identify the failure time window from timestamps around the errors.
+  d. Correlate controller and gateway log entries using the subdir name to know
+     which bundle each log line came from (e.g. *_controller/ vs *_gateway/).
+  NOTE: Do NOT delete {extract_dir} — it will be cleaned up automatically after you finish.
+"""
+    else:
+        evidence_steps = """
+Step 2 — No log files provided. Reason about the likely cause from:
+  - The Jira ticket description, error messages, and any stack traces in comments.
+  - The affected codebase area (read the relevant source files).
+  - Known patterns in this codebase (GatewayService contract, concurrency rules, etc.).
+"""
+    return f"""You are a senior Aviatrix engineer performing Root Cause Analysis (RCA).
+
+Step 1 — Fetch the Jira ticket:
+  Use the jira MCP tools to get the full description, error details, stack traces,
+  customer comments, and any attachments listed on {ctx.jira_ticket}.
+{evidence_steps}
+Step 3 — Understand the codebase:
+  Read the source files most likely involved in the failure.
+  Run `git log --oneline -10` to see recent changes that might be related.
+
+Step 4 — Produce the RCA.
+  Output ONLY this structured block — nothing else:
+
+ROOT_CAUSE_ANALYSIS:
+  WHAT:      <one sentence — what failed>
+  WHY:       <one sentence — the underlying cause>
+  COMPONENT: <Go package or Python module responsible>
+  EVIDENCE:
+    - <quoted log line with timestamp, or Jira comment, or code location>
+    - <second piece of evidence>
+  FIX:       <specific actionable fix — file:line if known>
+
+Repo: {ctx.repo_path}
+Jira: {ctx.jira_ticket}"""
+
+
+def failure_rca_prompt(ctx, failure_context: str) -> str:
+    return f"""You are a senior Aviatrix engineer performing Root Cause Analysis on a test or review failure.
+
+Failure context:
+{failure_context}
+
+Steps:
+1. Run `git diff` to see what code changed.
+2. Run `git status` to see which files are affected.
+3. Look at the specific files and lines mentioned in the failure output.
+4. Identify what the failure is — build error, test assertion, panic, lint issue, etc.
+
+Output ONLY this structured block — nothing else:
+
+ROOT_CAUSE_ANALYSIS:
+  WHAT:     <one sentence — what failed>
+  WHY:      <one sentence — the underlying cause>
+  EVIDENCE:
+    - <specific file:line or quoted error message>
+  FIX:      <specific actionable fix — file:line>
+
+Repo: {ctx.repo_path}
 Jira: {ctx.jira_ticket}"""
 
 
