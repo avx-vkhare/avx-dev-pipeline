@@ -83,11 +83,27 @@ fi
 # not available" message).
 if ! "$PYTHON" -c "import ensurepip, venv" >/dev/null 2>&1; then
     PY_PKG=$("$PYTHON" -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}-venv')")
-    echo "ERROR: Python's venv module is not fully installed."
-    echo "On Debian/Ubuntu run:"
-    echo "    sudo apt install -y $PY_PKG"
-    echo "then re-run this installer."
-    exit 1
+    echo "Python's venv module is not fully installed (need $PY_PKG)."
+    INSTALLED=""
+    # Offer to install it via sudo — but only with explicit consent and only
+    # if we have a controlling tty (so curl|bash can't silently escalate).
+    if command -v apt >/dev/null 2>&1 && [ -e /dev/tty ]; then
+        read -r -p "Install $PY_PKG via 'sudo apt install -y $PY_PKG' now? [Y/n] " ANS </dev/tty
+        case "${ANS:-Y}" in
+            [Yy]*|"")
+                if sudo apt install -y "$PY_PKG"; then
+                    INSTALLED=1
+                fi
+                ;;
+        esac
+    fi
+    if [ -z "$INSTALLED" ] || ! "$PYTHON" -c "import ensurepip, venv" >/dev/null 2>&1; then
+        echo
+        echo "ERROR: venv is still unavailable. On Debian/Ubuntu run:"
+        echo "    sudo apt install -y $PY_PKG"
+        echo "then re-run this installer."
+        exit 1
+    fi
 fi
 
 if [ ! -d "$VENV_DIR" ]; then
