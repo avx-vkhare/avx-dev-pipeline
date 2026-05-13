@@ -106,7 +106,11 @@ if ! "$PYTHON" -c "import ensurepip, venv" >/dev/null 2>&1; then
     fi
 fi
 
-if [ ! -d "$VENV_DIR" ]; then
+if [ ! -x "$VENV_DIR/bin/pip" ]; then
+    if [ -d "$VENV_DIR" ]; then
+        echo "Removing broken/incomplete venv at $VENV_DIR ..."
+        rm -rf "$VENV_DIR"
+    fi
     echo "Creating virtualenv at $VENV_DIR ..."
     "$PYTHON" -m venv "$VENV_DIR"
 fi
