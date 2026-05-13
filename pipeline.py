@@ -22,6 +22,7 @@ from claude_agent_sdk import (
 
 from context import ProjectContext
 from agents.prompts import planner_prompt, coder_prompt, test_writer_prompt, reviewer_prompt, pr_creator_prompt, pr_comments_prompt, rca_prompt, failure_rca_prompt
+from preflight import run_preflight, all_critical_pass, format_results
 
 STATE_FILE = ".pipeline_state.json"
 MAX_ITERATIONS = 3
@@ -114,17 +115,22 @@ def setup_branch(ctx: ProjectContext, emit_fn) -> None:
 # Agent runner
 # ---------------------------------------------------------------------------
 
-# Jira MCP server config — read from ~/.claude/settings.json credentials
+# Jira / Atlassian MCP server config — read from ~/.claude/settings.json.
+# Prefers the official Atlassian-MCP-Server (OAuth, no token paste) and
+# falls back to a token-based `jira` server if that's all the user has.
 def _jira_mcp_server() -> dict:
     import json, os
     settings_path = os.path.expanduser("~/.claude/settings.json")
     try:
-        cfg = json.loads(open(settings_path).read()).get("mcpServers", {}).get("jira", {})
-        if cfg:
-            return {"jira": cfg}
+        servers = json.loads(open(settings_path).read()).get("mcpServers", {})
     except Exception:
-        pass
-    return {}
+        return {}
+    out = {}
+    for key in ("Atlassian-MCP-Server", "jira"):
+        cfg = servers.get(key)
+        if cfg and cfg.get("enabled", True):
+            out[key] = cfg
+    return out
 
 
 def _tool_status(tool_name: str, tool_input: dict) -> str:
@@ -369,6 +375,16 @@ async def run_pipeline(
     if emit_fn is None:
         emit_fn = print
 
+    # --- Pre-flight checks (fail fast before any real work) ---
+    pre = run_preflight(ctx.repo_path)
+    emit_fn(f"\n=== Pre-flight checks ===\n{format_results(pre)}\n")
+    if not all_critical_pass(pre):
+        emit_fn(
+            "\n✗ Pre-flight failed. Fix the items above (the UI's Re-check button "
+            "will re-run these), then start again."
+        )
+        return
+
     # --- Resume or start fresh ---
     state = load_state(ctx)
     if state:
@@ -425,7 +441,8 @@ async def run_pipeline(
                 f"Jira ticket: {ctx.jira_ticket}\n"
                 f"Task: {ctx.task_description}\n"
                 + (f"RCA: {rca}\n" if rca else "")
-                + f"\nFirst fetch the Jira ticket using the jira MCP tools to get the full "
+                + f"\nFirst fetch the Jira ticket using whichever Atlassian/Jira MCP "
+                f"tools are available (e.g. Atlassian-MCP-Server or jira) to get the full "
                 f"description, acceptance criteria, and any linked issues. "
                 f"Then explore the codebase and produce the plan."
             ),

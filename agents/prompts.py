@@ -181,8 +181,11 @@ Step 2 — No log files provided. Reason about the likely cause from:
     return f"""You are a senior Aviatrix engineer performing Root Cause Analysis (RCA).
 
 Step 1 — Fetch the Jira ticket:
-  Use the jira MCP tools to get the full description, error details, stack traces,
-  customer comments, and any attachments listed on {ctx.jira_ticket}.
+  Use whichever Atlassian/Jira MCP tools are available (e.g. Atlassian-MCP-Server
+  or jira) to get the full description, error details, stack traces, customer
+  comments, and any attachments listed on {ctx.jira_ticket}.
+  If the first call returns an OAuth-authentication URL, surface it in your
+  response so the user can complete the browser approval, then retry.
 {evidence_steps}
 Step 3 — Understand the codebase:
   Read the source files most likely involved in the failure.

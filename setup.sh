@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
+# One-click installer for BhramASTRA.
+#
+#   - Creates a virtualenv and installs deps
+#   - Writes the Atlassian-MCP-Server block to ~/.claude/settings.json
+#     (OAuth-based; no token paste — browser approval happens on first use)
+#   - Runs preflight checks and reports what (if anything) the user must fix
+#
+# Re-runnable; everything is idempotent.
+
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON=${PYTHON:-/usr/bin/python3}
-VENV_DIR="$(dirname "$0")/.venv"
+VENV_DIR="$SCRIPT_DIR/.venv"
+SETTINGS="$HOME/.claude/settings.json"
 
-echo "=== Dev Pipeline Setup ==="
+echo "=== BhramASTRA setup ==="
 
-# 1. Check Python version
+# 1. Python version
 PY_VERSION=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 echo "Python: $PYTHON ($PY_VERSION)"
 if [[ "$PY_VERSION" < "3.10" ]]; then
@@ -15,52 +26,39 @@ if [[ "$PY_VERSION" < "3.10" ]]; then
     exit 1
 fi
 
-# 2. Create virtualenv
+# 2. Virtualenv + deps
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtualenv at $VENV_DIR ..."
     "$PYTHON" -m venv "$VENV_DIR"
-else
-    echo "Virtualenv already exists at $VENV_DIR"
 fi
-
-# 3. Install dependencies
 echo "Installing dependencies..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-"$VENV_DIR/bin/pip" install -q -r "$(dirname "$0")/requirements.txt"
+"$VENV_DIR/bin/pip" install -q -r "$SCRIPT_DIR/requirements.txt"
 echo "Dependencies installed."
 
-# 4. Check Claude API key
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-    SETTINGS="$HOME/.claude/settings.json"
-    if [ ! -f "$SETTINGS" ] || ! grep -q "apiKey\|api_key" "$SETTINGS" 2>/dev/null; then
-        echo ""
-        echo "WARNING: ANTHROPIC_API_KEY is not set."
-        echo "  Export it before running:  export ANTHROPIC_API_KEY=sk-ant-..."
-        echo "  Or add it to ~/.claude/settings.json"
-    else
-        echo "Claude config found at $SETTINGS"
-    fi
-else
-    echo "ANTHROPIC_API_KEY is set."
-fi
+# 3. Auto-write Atlassian-MCP-Server block (OAuth, no token paste)
+echo "Configuring Atlassian MCP (OAuth)..."
+"$VENV_DIR/bin/python" - <<'PY'
+import sys
+sys.path.insert(0, ".")
+from preflight import write_atlassian_mcp_block, _settings_path
+added = write_atlassian_mcp_block()
+print(f"  {'added' if added else 'already present'} in {_settings_path()}")
+PY
 
-# 5. Check Jira MCP config
-SETTINGS="$HOME/.claude/settings.json"
-if [ -f "$SETTINGS" ] && grep -q '"jira"' "$SETTINGS" 2>/dev/null; then
-    echo "Jira MCP config found."
-else
-    echo ""
-    echo "WARNING: Jira MCP server not configured in ~/.claude/settings.json"
-    echo "  Add an entry like:"
-    echo '  { "mcpServers": { "jira": { "command": "...", "env": { "JIRA_URL": "...", "JIRA_TOKEN": "..." } } } }'
-    echo "  (Pipeline still works without it — Jira ticket details won't be fetched.)"
-fi
+# 4. Run preflight — tells the user exactly what (if anything) still needs fixing
+echo
+"$VENV_DIR/bin/python" "$SCRIPT_DIR/preflight.py" "$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || dirname "$SCRIPT_DIR")" || PREFLIGHT_FAILED=1
 
-echo ""
+echo
 echo "=== Setup complete ==="
-echo ""
-echo "To run the UI:"
-echo "  $VENV_DIR/bin/python ui.py"
-echo ""
+echo
+if [ -n "$PREFLIGHT_FAILED" ]; then
+    echo "Fix the items marked ✗ above, then re-run this script (or click Re-check in the UI)."
+    echo
+fi
+echo "Launch the UI:"
+echo "  $VENV_DIR/bin/python $SCRIPT_DIR/ui.py"
+echo
 echo "Or add this alias to your shell profile:"
-echo "  alias dev-pipeline='$VENV_DIR/bin/python $(dirname "$0")/ui.py'"
+echo "  alias bhramastra='$VENV_DIR/bin/python $SCRIPT_DIR/ui.py'"

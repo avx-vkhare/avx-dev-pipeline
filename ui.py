@@ -5,9 +5,11 @@ Run:  /usr/bin/python3 ui.py
 Then open http://127.0.0.1:7860
 """
 
+import os
 import queue
 import random
 import string
+import subprocess
 import threading
 import anyio
 print("[ui] importing gradio...", flush=True)
@@ -17,6 +19,9 @@ print(f"[ui] gradio {gr.__version__} loaded", flush=True)
 print("[ui] importing pipeline...", flush=True)
 from context import ProjectContext
 from pipeline import run_pipeline
+from preflight import (
+    run_preflight, all_critical_pass, format_results, write_atlassian_mcp_block,
+)
 print("[ui] pipeline imported ok", flush=True)
 
 # ---------------------------------------------------------------------------
@@ -105,15 +110,55 @@ def progress_html(active: str, spinning: bool) -> str:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-REPO_PATH = "/home/vkhare/cloudn"
+def _detect_repo_path() -> str:
+    """Auto-detect the repo: env var > git toplevel > parent of this file."""
+    env = os.environ.get("BHRAMASTRA_REPO")
+    if env and os.path.isdir(env):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    r = subprocess.run(
+        ["git", "-C", here, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    return os.path.dirname(here)
+
+
+REPO_PATH = _detect_repo_path()
 LANGUAGE  = "Go and Python"
+print(f"[ui] repo: {REPO_PATH}", flush=True)
+
+
 def _random_suffix(n=8) -> str:
     return "".join(random.choices(string.ascii_lowercase, k=n))
 
 
+def _preflight_markdown(results) -> str:
+    icon = {"ok": "✅", "fail": "❌", "warn": "⚠️"}
+    lines = ["### System Setup"]
+    for r in results:
+        lines.append(f"- {icon[r.status]} **{r.name}** — {r.message}")
+        if r.status != "ok" and r.fix_hint:
+            lines.append(f"  - _fix:_ {r.fix_hint}")
+            if r.fix_command:
+                lines.append(f"  - `{r.fix_command}`")
+    return "\n".join(lines)
+
+
 with gr.Blocks(title="BhramASTRA") as demo:
     gr.Markdown("# BhramASTRA")
+    gr.Markdown(f"_Repo: `{REPO_PATH}`_")
     progress_bar = gr.HTML(value=progress_html("plan", False))
+
+    # ---- System Setup (preflight) -----------------------------------------
+    _initial_pre = run_preflight(REPO_PATH)
+    _initial_ready = all_critical_pass(_initial_pre)
+    with gr.Accordion("🛠  System Setup", open=not _initial_ready):
+        setup_status = gr.Markdown(value=_preflight_markdown(_initial_pre))
+        with gr.Row():
+            recheck_btn = gr.Button("🔄  Re-check")
+            autofix_btn = gr.Button("🪄  Auto-fix what I can")
 
     # ---- Config form -------------------------------------------------------
     with gr.Accordion("⚙️  Task Configuration", open=True) as config_panel:
@@ -148,8 +193,13 @@ with gr.Blocks(title="BhramASTRA") as demo:
                 send_btn = gr.Button("Send", scale=1, interactive=False)
 
     with gr.Row():
-        start_btn = gr.Button("▶ Start Pipeline", variant="primary")
-        status    = gr.Textbox(value="Idle", label="Status", interactive=False, scale=3)
+        start_btn = gr.Button(
+            "▶ Start Pipeline", variant="primary", interactive=_initial_ready,
+        )
+        status    = gr.Textbox(
+            value="Idle" if _initial_ready else "⚠ Fix System Setup items before starting.",
+            label="Status", interactive=False, scale=3,
+        )
 
     waiting    = gr.State(False)
     cur_stage  = gr.State("plan")
@@ -168,6 +218,18 @@ with gr.Blocks(title="BhramASTRA") as demo:
                 gr.update(value="⚠ Fill in Jira Ticket and Task first."),  # status
                 gr.update(),                              # progress_bar
                 gr.update(),                              # action_bar
+            )
+
+        # Hard gate: preflight must pass before we burn API time
+        pre = run_preflight(REPO_PATH)
+        if not all_critical_pass(pre):
+            return (
+                gr.update(),
+                gr.update(), gr.update(), gr.update(),
+                gr.update(interactive=False),
+                gr.update(value="⚠ System Setup has failing checks — see panel above."),
+                gr.update(),
+                gr.update(),
             )
 
         # Auto-generate branch name
@@ -261,6 +323,35 @@ with gr.Blocks(title="BhramASTRA") as demo:
         history = history + [{"role": "user", "content": user_msg}]
         input_q.put(user_msg.strip())
         return history, "", False
+
+    # ---- Setup-panel handlers ----------------------------------------------
+    def do_recheck():
+        results = run_preflight(REPO_PATH)
+        ready = all_critical_pass(results)
+        return (
+            gr.update(value=_preflight_markdown(results)),
+            gr.update(interactive=ready),
+            gr.update(value="Idle" if ready else "⚠ Fix System Setup items before starting."),
+        )
+
+    def do_autofix():
+        added = write_atlassian_mcp_block()
+        # any other auto-fixable items would slot in here
+        results = run_preflight(REPO_PATH)
+        ready = all_critical_pass(results)
+        note = "Added Atlassian-MCP-Server block.\n\n" if added else ""
+        return (
+            gr.update(value=note + _preflight_markdown(results)),
+            gr.update(interactive=ready),
+            gr.update(value="Idle" if ready else "⚠ Some items still need manual fixes."),
+        )
+
+    recheck_btn.click(
+        do_recheck, inputs=[], outputs=[setup_status, start_btn, status],
+    )
+    autofix_btn.click(
+        do_autofix, inputs=[], outputs=[setup_status, start_btn, status],
+    )
 
     # ---- Wire events -------------------------------------------------------
     start_btn.click(
