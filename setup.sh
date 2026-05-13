@@ -78,6 +78,18 @@ if [[ "$PY_VERSION" < "3.10" ]]; then
     exit 1
 fi
 
+# Probe that venv is fully installed (Debian/Ubuntu ship pythonX.Y-venv as a
+# separate package — without it `python3 -m venv` fails with an "ensurepip is
+# not available" message).
+if ! "$PYTHON" -c "import ensurepip, venv" >/dev/null 2>&1; then
+    PY_PKG=$("$PYTHON" -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}-venv')")
+    echo "ERROR: Python's venv module is not fully installed."
+    echo "On Debian/Ubuntu run:"
+    echo "    sudo apt install -y $PY_PKG"
+    echo "then re-run this installer."
+    exit 1
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtualenv at $VENV_DIR ..."
     "$PYTHON" -m venv "$VENV_DIR"
