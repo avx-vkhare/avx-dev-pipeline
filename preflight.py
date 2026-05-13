@@ -23,6 +23,20 @@ WARN = "warn"
 
 ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
 
+CONFIG_PATH = Path.home() / ".config" / "bhramastra" / "config.json"
+
+# Common locations where Aviatrix devs keep the cloudn checkout. First match
+# that looks like cloudn is used as a default.
+CLOUDN_CANDIDATES = [
+    "~/cloudn",
+    "~/work/cloudn",
+    "~/src/cloudn",
+    "~/code/cloudn",
+    "~/dev/cloudn",
+    "~/aviatrix/cloudn",
+    "~/projects/cloudn",
+]
+
 
 @dataclass
 class CheckResult:
@@ -56,6 +70,71 @@ def _save_settings(cfg: dict) -> None:
     p = _settings_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Config store ( ~/.config/bhramastra/config.json )
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def save_config(**updates) -> None:
+    cfg = load_config()
+    cfg.update(updates)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def is_cloudn_repo(path: str | Path) -> bool:
+    """Heuristic: does `path` look like a cloudn checkout?"""
+    p = Path(path).expanduser()
+    if not (p / ".git").exists():
+        return False
+    # cloudn-specific fingerprint: at least one of these dirs must be present.
+    for marker in ("cloudx-local", "cloudx-gateway", "go/aviatrix.com"):
+        if (p / marker).exists():
+            return True
+    return False
+
+
+def detect_cloudn_repo() -> str:
+    """Find the cloudn checkout. Resolution order:
+
+      1. Config file ( ~/.config/bhramastra/config.json -> cloudn_repo )
+      2. $BHRAMASTRA_REPO env var
+      3. cwd's git toplevel, if it looks like cloudn
+      4. Scan CLOUDN_CANDIDATES for the first match that looks like cloudn
+
+    Returns "" if nothing was found.
+    """
+    cfg_path = load_config().get("cloudn_repo")
+    if cfg_path and is_cloudn_repo(cfg_path):
+        return str(Path(cfg_path).expanduser())
+
+    env = os.environ.get("BHRAMASTRA_REPO")
+    if env and is_cloudn_repo(env):
+        return str(Path(env).expanduser())
+
+    r = subprocess.run(
+        ["git", "-C", os.getcwd(), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0 and r.stdout.strip() and is_cloudn_repo(r.stdout.strip()):
+        return r.stdout.strip()
+
+    for candidate in CLOUDN_CANDIDATES:
+        path = str(Path(candidate).expanduser())
+        if is_cloudn_repo(path):
+            return path
+
+    return ""
 
 
 # ---------------------------------------------------------------------------

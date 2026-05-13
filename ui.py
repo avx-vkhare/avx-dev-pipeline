@@ -9,7 +9,6 @@ import os
 import queue
 import random
 import string
-import subprocess
 import threading
 import anyio
 print("[ui] importing gradio...", flush=True)
@@ -21,6 +20,7 @@ from context import ProjectContext
 from pipeline import run_pipeline
 from preflight import (
     run_preflight, all_critical_pass, format_results, write_atlassian_mcp_block,
+    detect_cloudn_repo, save_config, is_cloudn_repo,
 )
 print("[ui] pipeline imported ok", flush=True)
 
@@ -110,22 +110,7 @@ def progress_html(active: str, spinning: bool) -> str:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-def _detect_repo_path() -> str:
-    """Auto-detect the repo: env var > git toplevel > parent of this file."""
-    env = os.environ.get("BHRAMASTRA_REPO")
-    if env and os.path.isdir(env):
-        return env
-    here = os.path.dirname(os.path.abspath(__file__))
-    r = subprocess.run(
-        ["git", "-C", here, "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True,
-    )
-    if r.returncode == 0 and r.stdout.strip():
-        return r.stdout.strip()
-    return os.path.dirname(here)
-
-
-REPO_PATH = _detect_repo_path()
+REPO_PATH = detect_cloudn_repo()
 LANGUAGE  = "Go and Python"
 print(f"[ui] repo: {REPO_PATH}", flush=True)
 
@@ -148,14 +133,23 @@ def _preflight_markdown(results) -> str:
 
 with gr.Blocks(title="BhramASTRA") as demo:
     gr.Markdown("# BhramASTRA")
-    gr.Markdown(f"_Repo: `{REPO_PATH}`_")
     progress_bar = gr.HTML(value=progress_html("plan", False))
 
-    # ---- System Setup (preflight) -----------------------------------------
-    _initial_pre = run_preflight(REPO_PATH)
-    _initial_ready = all_critical_pass(_initial_pre)
+    # ---- Target repo + System Setup (preflight) ---------------------------
+    _initial_pre = run_preflight(REPO_PATH) if REPO_PATH else []
+    _initial_ready = bool(REPO_PATH) and all_critical_pass(_initial_pre)
     with gr.Accordion("🛠  System Setup", open=not _initial_ready):
-        setup_status = gr.Markdown(value=_preflight_markdown(_initial_pre))
+        repo_path_box = gr.Textbox(
+            label="Target repo (absolute path to the codebase you want to work on)",
+            value=REPO_PATH,
+            placeholder="/home/you/your-repo",
+        )
+        setup_status = gr.Markdown(
+            value=(
+                _preflight_markdown(_initial_pre) if REPO_PATH
+                else "_Enter a target repo path above, then click Re-check._"
+            )
+        )
         with gr.Row():
             recheck_btn = gr.Button("🔄  Re-check")
             autofix_btn = gr.Button("🪄  Auto-fix what I can")
@@ -206,22 +200,34 @@ with gr.Blocks(title="BhramASTRA") as demo:
     action_log = gr.State("")
 
     # ---- Handlers ----------------------------------------------------------
-    def start_pipeline(ticket, task, uploaded_files):
+    def start_pipeline(ticket, task, uploaded_files, repo):
         global pipeline_thread, output_q, input_q
 
+        repo = (repo or "").strip()
+
         # Validate required fields
-        if not ticket.strip() or not task.strip():
+        if not ticket.strip() or not task.strip() or not repo:
             return (
                 gr.update(),                              # chatbot
                 gr.update(), gr.update(), gr.update(),   # waiting, cur_stage, action_log
                 gr.update(interactive=True),              # start_btn stays enabled
-                gr.update(value="⚠ Fill in Jira Ticket and Task first."),  # status
+                gr.update(value="⚠ Fill in target repo, Jira Ticket and Task first."),  # status
                 gr.update(),                              # progress_bar
                 gr.update(),                              # action_bar
             )
 
+        if not os.path.isdir(repo):
+            return (
+                gr.update(),
+                gr.update(), gr.update(), gr.update(),
+                gr.update(interactive=True),
+                gr.update(value=f"⚠ Target repo `{repo}` is not a directory."),
+                gr.update(),
+                gr.update(),
+            )
+
         # Hard gate: preflight must pass before we burn API time
-        pre = run_preflight(REPO_PATH)
+        pre = run_preflight(repo)
         if not all_critical_pass(pre):
             return (
                 gr.update(),
@@ -248,7 +254,7 @@ with gr.Blocks(title="BhramASTRA") as demo:
             if path:
                 log_files.append(path)
         ctx = ProjectContext.from_repo(
-            repo_path=REPO_PATH,
+            repo_path=repo,
             jira_ticket=ticket.strip(),
             task=task.strip(),
             branch=branch,
@@ -325,8 +331,23 @@ with gr.Blocks(title="BhramASTRA") as demo:
         return history, "", False
 
     # ---- Setup-panel handlers ----------------------------------------------
-    def do_recheck():
-        results = run_preflight(REPO_PATH)
+    def do_recheck(repo):
+        repo = (repo or "").strip()
+        if not repo or not os.path.isdir(repo):
+            return (
+                gr.update(value=f"❌ Target repo `{repo or '(empty)'}` is not a directory."),
+                gr.update(interactive=False),
+                gr.update(value="⚠ Enter a valid target repo path."),
+            )
+        if not is_cloudn_repo(repo):
+            return (
+                gr.update(value=f"❌ `{repo}` doesn't look like a cloudn checkout (missing .git or cloudx-* / go/aviatrix.com dirs)."),
+                gr.update(interactive=False),
+                gr.update(value="⚠ Point to a valid cloudn checkout."),
+            )
+        # Persist the user's choice so the next launch picks it up automatically
+        save_config(cloudn_repo=repo)
+        results = run_preflight(repo)
         ready = all_critical_pass(results)
         return (
             gr.update(value=_preflight_markdown(results)),
@@ -334,29 +355,27 @@ with gr.Blocks(title="BhramASTRA") as demo:
             gr.update(value="Idle" if ready else "⚠ Fix System Setup items before starting."),
         )
 
-    def do_autofix():
+    def do_autofix(repo):
         added = write_atlassian_mcp_block()
-        # any other auto-fixable items would slot in here
-        results = run_preflight(REPO_PATH)
-        ready = all_critical_pass(results)
         note = "Added Atlassian-MCP-Server block.\n\n" if added else ""
+        status_update, btn_update, msg_update = do_recheck(repo)
         return (
-            gr.update(value=note + _preflight_markdown(results)),
-            gr.update(interactive=ready),
-            gr.update(value="Idle" if ready else "⚠ Some items still need manual fixes."),
+            gr.update(value=note + status_update["value"]),
+            btn_update,
+            msg_update,
         )
 
     recheck_btn.click(
-        do_recheck, inputs=[], outputs=[setup_status, start_btn, status],
+        do_recheck, inputs=[repo_path_box], outputs=[setup_status, start_btn, status],
     )
     autofix_btn.click(
-        do_autofix, inputs=[], outputs=[setup_status, start_btn, status],
+        do_autofix, inputs=[repo_path_box], outputs=[setup_status, start_btn, status],
     )
 
     # ---- Wire events -------------------------------------------------------
     start_btn.click(
         start_pipeline,
-        inputs=[fi_ticket, fi_task, fi_log_upload],
+        inputs=[fi_ticket, fi_task, fi_log_upload, repo_path_box],
         outputs=[chatbot, waiting, cur_stage, action_log, start_btn, status, progress_bar, action_bar],
     )
 
