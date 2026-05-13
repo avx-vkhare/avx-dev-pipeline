@@ -137,11 +137,13 @@ Your job:
 3. Commit with message format: "{ctx.jira_ticket}: <short description>"
    - The description should be a concise summary of the change (max 72 chars total).
 4. Push to remote: `git push -u origin {ctx.branch_name}`
-5. Create a PR with `gh pr create --draft`. Use a HEREDOC for the body.
+5. Ensure the `bhramastra` label exists (idempotent — silently ignore "already exists"):
+   `gh label create bhramastra --color 6f42c1 --description "Raised by the BhramASTRA dev pipeline" 2>/dev/null || true`
+6. Create a PR with `gh pr create --draft --label bhramastra`. Use a HEREDOC for the body.
    - Title: "{ctx.jira_ticket}: <same short description as commit>"
    - Body sections: ## Summary, ## Test plan, ## Jira
    - Jira link: https://aviatrix.atlassian.net/browse/{ctx.jira_ticket}
-6. Print the PR URL as the very last line of your output (just the URL, nothing else).
+7. Print the PR URL as the very last line of your output (just the URL, nothing else).
 
 Rules:
 - Never use `git add -A` or `git add .` — add files individually.
