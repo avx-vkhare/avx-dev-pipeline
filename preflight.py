@@ -142,16 +142,28 @@ def detect_cloudn_repo() -> str:
 # ---------------------------------------------------------------------------
 
 def check_claude_session() -> CheckResult:
-    """Claude Code session OR ANTHROPIC_API_KEY env var."""
+    """Detect any of the three ways the SDK can find credentials:
+
+      1. ANTHROPIC_API_KEY env var
+      2. CLAUDE_CODE_SSE_PORT env var — set inside Claude Code IDE shells;
+         the SDK proxies auth through the running Claude Code instance.
+      3. ~/.claude/.credentials.json — created by standalone `claude login`.
+    """
     if os.environ.get("ANTHROPIC_API_KEY"):
         return CheckResult("Claude session", OK, "ANTHROPIC_API_KEY is set")
+    if os.environ.get("CLAUDE_CODE_SSE_PORT"):
+        return CheckResult(
+            "Claude session", OK,
+            "Claude Code IDE session detected (via $CLAUDE_CODE_SSE_PORT)",
+        )
     cred = Path.home() / ".claude" / ".credentials.json"
     if cred.exists():
         return CheckResult("Claude session", OK, "Claude Code credentials found")
     return CheckResult(
         "Claude session", FAIL,
         "no Claude credentials found",
-        "Run `claude login` (Claude Code) — or export ANTHROPIC_API_KEY",
+        "Launch from inside a Claude Code terminal, OR run `claude login`, "
+        "OR export ANTHROPIC_API_KEY",
         "claude login",
     )
 
